@@ -23,6 +23,7 @@ Configuração (.env na mesma pasta):
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -173,34 +174,48 @@ def buscar_detalhe_pedido(order_id: str) -> dict:
         return resposta.json()
 
 
-def enriquecer_pedidos(df: pd.DataFrame) -> pd.DataFrame:
+def enriquecer_pedidos(df: pd.DataFrame, max_workers: int = 10) -> pd.DataFrame:
     """
     Para cada pedido, busca o detalhe individual e extrai email, telefone
-    e cupom utilizado. Faz 1 chamada extra de API por pedido — com volume
-    de 6 meses isso pode ser bastante coisa, por isso mostra progresso.
+    e cupom utilizado. Faz 1 chamada extra de API por pedido.
+
+    Roda várias chamadas em paralelo (max_workers) em vez de uma por vez —
+    a VTEX permite até 5.000 requisições/minuto por conta, bem acima do
+    que usamos aqui mesmo com paralelismo. Se começar a aparecer muito
+    aviso de rate limit (429) no meio da execução, reduza max_workers.
     """
     df = df.copy()
-    emails, telefones, cupons = [], [], []
-    total = len(df)
+    order_ids = df["orderId"].tolist()
+    total = len(order_ids)
+    resultados = [None] * total
+    concluidos = 0
 
-    for i, order_id in enumerate(df["orderId"], start=1):
-        if i % 25 == 0 or i == total:
-            print(f"Processando pedido {i}/{total}...")
-
+    def processar(indice: int, order_id: str) -> tuple:
         detalhe = buscar_detalhe_pedido(order_id)
-
         perfil = detalhe.get("clientProfileData") or {}
         marketing = detalhe.get("marketingData") or {}
+        return indice, {
+            "email": limpar_email_mascarado(perfil.get("email")),
+            "telefone": perfil.get("phone"),
+            "cupom": marketing.get("coupon"),
+        }
 
-        emails.append(limpar_email_mascarado(perfil.get("email")))
-        telefones.append(perfil.get("phone"))
-        cupons.append(marketing.get("coupon"))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futuros = [
+            executor.submit(processar, indice, order_id)
+            for indice, order_id in enumerate(order_ids)
+        ]
 
-        time.sleep(0.3)
+        for futuro in as_completed(futuros):
+            indice, dados = futuro.result()
+            resultados[indice] = dados
+            concluidos += 1
+            if concluidos % 100 == 0 or concluidos == total:
+                print(f"Processados {concluidos}/{total} pedidos...")
 
-    df["email_cliente"] = emails
-    df["telefone_cliente"] = telefones
-    df["cupom_utilizado"] = cupons
+    df["email_cliente"] = [r["email"] for r in resultados]
+    df["telefone_cliente"] = [r["telefone"] for r in resultados]
+    df["cupom_utilizado"] = [r["cupom"] for r in resultados]
 
     return df
 
